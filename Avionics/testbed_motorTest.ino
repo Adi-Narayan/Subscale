@@ -10,6 +10,7 @@
 #define D4184B        5
 #define LOAD          A5
 #define INBUILT_LED   13
+#define PRESSURE      A0
 
 // State Machine Definition
 typedef enum {
@@ -26,8 +27,8 @@ SoftwareSerial RYLR(RX_RYLR, TX_RYLR);
 File logFile;
 float loadCellReading, weight, calRead, calFactor = 1.29;
 float startTime = 0, timeStamp;
-String currState, response, weightString;
-
+String currState, response, logString;
+int pressureAdc;
 // Prototype Function Definitions
 float mapVtoKG(float read) { // Not mapped properly yet
   return (calFactor*read*500.0)/1023.0;
@@ -55,20 +56,23 @@ void getData() {
   loadCellReading = analogRead(LOAD);
   weight = mapVtoKG(loadCellReading);
   timeStamp = (millis() - startTime)/1000;
-  weightString = String(timeStamp)+":"+String(loadCellReading);
-  Serial.println(weightString+":"+weight);
+  // logString = String(timeStamp)+":"+String(loadCellReading);
+  // Serial.println(weightString+":"+weight);
+  pressureReading = analogRead(PRESSURE);
+  logString = String(timeStamp)+":"+String(loadCellReading)+", pressureADC: "+String(pressureReading);
+  Serial.println(logString+":"+weight);
   delay(10);
 }
 
 void logData() {
   logFile = SD.open("loadcell.txt", FILE_WRITE);
-  logFile.print(weightString);
+  logFile.print(logString);
   logFile.print(":");
-  logFile.println(weight);
+  logFile.print(weight);
   logFile.close();
 }
 void sendData() {
-  String transmit = "AT+SEND=0," + String(weightString.length()) + "," + weightString + "\r\n";
+  String transmit = "AT+SEND=0," + String(logString.length()) + "," + logString + "\r\n";
   //added a flushing buffer at 22:16 on 6Oct24
   RYLR.flush();
   //yep thassit, ek receiving side pe bhi clear buffer rakha hai 
