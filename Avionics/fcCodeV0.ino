@@ -7,6 +7,16 @@
 #include <ESP32Servo.h>
 #include <QuickPID.h>
 
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+
+// for gps
+static const int RXPin = 4, TXPin = 5;
+static const uint32_t GPSBaud = 9600;
+
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(2);
+
 //definitions
 
 //for imu
@@ -26,8 +36,16 @@ Adafruit_BNO055 bno = Adafruit_BNO055(55, 0x28);
 // SPI Pins (adjust as needed)
 #define CS_PIN 5  // Chip Select (CS) for MS5607
 
-//for gps
+//for recovery
+// Parachute and buzzer pins
+#define DROGUE_CHUTE_PIN  25
+#define MAIN_CHUTE_PIN    26
+#define BUZZER_PIN        27
 
+// Thresholds
+#define BOOST_ACCELERATION 5.0   // 5g boost detection
+#define APOGEE_THRESHOLD   0.0   // Negative acceleration for burnout
+#define MAIN_CHUTE_ALT     1500
 //End of definitions
 
 //variables
@@ -59,6 +77,19 @@ QuickPID airbrakePID(&pidOutput, &predictedApogee, &targetApogee, Kp, Ki, Kd);
 
 
 //end of variables
+
+//states for fsm
+enum RocketState {
+    IDLE,
+    ARMED,
+    BOOST,
+    COAST,
+    DROGUE,
+    MAIN,
+    LANDED
+};
+
+RocketState state = IDLE;
 
 //IMU
 bool initBNO()
@@ -122,7 +153,25 @@ void readADC(uint8_t cmd) {
 }
 //end of ms607
 
-//bc gps ka kaun lega readings?
+//gps
+void getGPSData()
+{
+  while (gpsSerial.available() > 0) {
+        char c = gpsSerial.read();
+        gps.encode(c);  // Feed characters to the TinyGPS++ library
+
+        if (gps.location.isUpdated()) {  // Check if new GPS data is available
+            Serial.print("Latitude: "); 
+            Serial.print(gps.location.lat(), 6);
+            Serial.print(" | Longitude: "); 
+            Serial.print(gps.location.lng(), 6);
+            Serial.print(" | Altitude: "); 
+            Serial.print(gps.altitude.meters());
+            Serial.print("m | Satellites: ");
+            Serial.println(gps.satellites.value());
+        }
+  }
+}
 
 //flash data logging
 void logData()
@@ -133,7 +182,7 @@ void logData()
   {
     logfile.println(parameter);
     //call all get data functions
-    logfile.close();
+    logfile.close();    
   } 
   else 
   {
@@ -142,37 +191,41 @@ void logData()
 }
 
 //send data by rylr
-
+void sendData(String data) {
+  transmit = "AT+SEND=0," + String(data.length()) + "," + data + "\r\n";
+  RYLR.print(transmit);
+  delay(10); // Delay for proper transmission
+}
 
 //kalman filter the pressure data
 //sensor fusion
-// void kalmanFilter(float measured_altitude, float accel_y) {
-//     // Step 1: State Prediction
-//     float accel_earth = accel_y + g; // Convert to earth frame
-//     x[0] += x[1] * dt + 0.5 * accel_earth * dt * dt; // Altitude update
-//     x[1] += accel_earth * dt; // Velocity update
+void kalmanFilter(float measured_altitude, float accel_y) {
+    // Step 1: State Prediction
+    float accel_earth = accel_y + g; // Convert to earth frame
+    x[0] += x[1] * dt + 0.5 * accel_earth * dt * dt; // Altitude update
+    x[1] += accel_earth * dt; // Velocity update
     
-//     // Predict covariance matrix
-//     P[0][0] += dt * (dt * P[1][1] - P[0][1] - P[1][0] + Q[0][0]);
-//     P[0][1] += dt * (P[1][1] + Q[0][1]);
-//     P[1][0] += dt * (P[1][1] + Q[1][0]);
-//     P[1][1] += Q[1][1];
+    // Predict covariance matrix
+    P[0][0] += dt * (dt * P[1][1] - P[0][1] - P[1][0] + Q[0][0]);
+    P[0][1] += dt * (P[1][1] + Q[0][1]);
+    P[1][0] += dt * (P[1][1] + Q[1][0]);
+    P[1][1] += Q[1][1];
     
-//     // Step 2: Measurement Update
-//     float y = measured_altitude - x[0]; // Innovation
-//     float S = P[0][0] + R;
-//     float K[2] = {P[0][0] / S, P[1][0] / S}; // Kalman Gain
+    // Step 2: Measurement Update
+    float y = measured_altitude - x[0]; // Innovation
+    float S = P[0][0] + R;
+    float K[2] = {P[0][0] / S, P[1][0] / S}; // Kalman Gain
     
-//     // Update estimates
-//     x[0] += K[0] * y;
-//     x[1] += K[1] * y;
+    // Update estimates
+    x[0] += K[0] * y;
+    x[1] += K[1] * y;
     
-//     // Update covariance matrix
-//     P[0][0] -= K[0] * P[0][0];
-//     P[0][1] -= K[0] * P[0][1];
-//     P[1][0] -= K[1] * P[0][0];
-//     P[1][1] -= K[1] * P[0][1];
-// }
+    // Update covariance matrix
+    P[0][0] -= K[0] * P[0][0];
+    P[0][1] -= K[0] * P[0][1];
+    P[1][0] -= K[1] * P[0][0];
+    P[1][1] -= K[1] * P[0][1];
+}
 
 //servos for airbrakes
 void initAirbrakes()
@@ -184,38 +237,35 @@ void initAirbrakes()
   airbrakePID.SetOutputLimits(0,100);
 }
 
-// void airbrakes()
-// {
+void airbrakes()
+{
 
-//     // Predict apogee using RK4 Method (simplified placeholder calculation)
-//     predictedApogee = altitude + (velocity * 5.0); // Simplified estimation
+    // Predict apogee using RK4 Method (simplified placeholder calculation)
+    predictedApogee = altitude + (velocity * 5.0); // Simplified estimation
     
-//     // Compute error
-//     error = targetApogee - predictedApogee;
+    // Compute error
+    error = targetApogee - predictedApogee;
     
-//     // Apply PID control
-//     airbrakePID.Compute();
-//     int servoAngle = map(pidOutput, 0, 100, servoMinAngle, servoMaxAngle);
+    // Apply PID control
+    airbrakePID.Compute();
+    int servoAngle = map(pidOutput, 0, 100, servoMinAngle, servoMaxAngle);
     
-//     // Fail-safe check for excessive tilt
-//     if (abs(getRocketTilt()) >= 10) {
-//         airbrakeServo.write(servoMinAngle); // Retract airbrakes fully
-//         Serial.println("Fail-safe triggered: Excessive tilt detected!");
-//         return;
-//     }
-//      // Check if apogee is reached
-//     if (altitude >= targetApogee) {
-//         airbrakeServo.write(servoMinAngle); // Fully retract airbrakes
-//         Serial.println("Apogee reached. Airbrakes retracted.");
-//         while (1); // Stop further execution
-//     }
+    // Fail-safe check for excessive tilt
+    if (abs(getRocketTilt()) >= 10) {
+        airbrakeServo.write(servoMinAngle); // Retract airbrakes fully
+        Serial.println("Fail-safe triggered: Excessive tilt detected!");
+        return;
+    }
+     // Check if apogee is reached
+    if (altitude >= targetApogee) {
+        airbrakeServo.write(servoMinAngle); // Fully retract airbrakes
+        Serial.println("Apogee reached. Airbrakes retracted.");
+        while (1); // Stop further execution
+    }
     
-//     delay(100);
-// }
+    delay(100);
+}
 
-
-
-//apogee detection
 
 
 void setup() 
@@ -245,8 +295,110 @@ void setup()
     logfile.println("Flash initialised. ");
   }
 
+  //gps
+  gpsSerial.begin(GPSBaud, SERIAL_8N1, RXPin, TXPin);
+
 }
 
+//apogee detection
+// Reads IMU acceleration in Gs
+float readAcceleration() {
+    sensors_event_t a, g, temp;
+    mpu.getEvent(&a, &g, &temp);
+    return a.acceleration.z / 9.81;  // Convert to G
+}
+
+// Simulates arming condition
+bool isArmed() {
+    return true; // Replace with actual ground station signal check
+}
+
+// Detects apogee based on velocity trends
+bool detectApogee() {
+    static float lastAltitude = 0;
+    float currentAltitude = bmp.readAltitude(1013.25);
+    bool apogee = currentAltitude < lastAltitude;
+    lastAltitude = currentAltitude;
+    return apogee;
+}
+
+// Deploys drogue chute
+void deployDrogue() {
+    Serial.println("Drogue Chute Deployed!");
+    digitalWrite(DROGUE_CHUTE_PIN, HIGH);
+}
+
+// Deploys main chute
+void deployMain() {
+    Serial.println("Main Chute Deployed!");
+    digitalWrite(MAIN_CHUTE_PIN, HIGH);
+}
+
+// Detects landing based on IMU readings
+bool detectLanding() {
+    return (readAcceleration() < 0.1);
+}
+
+// Activates buzzer on landing
+void activateBuzzer() {
+    Serial.println("Buzzer Activated! Rocket Landed.");
+    digitalWrite(BUZZER_PIN, HIGH);
+}
+
+//fsm
+void fsm()
+{
+  switch (state) {
+        case IDLE:
+            Serial.println("State: IDLE");
+            if (isArmed()) {
+                state = ARMED;
+            }
+            break;
+
+        case ARMED:
+            Serial.println("State: ARMED");
+            if (acceleration > BOOST_ACCELERATION) {
+                state = BOOST;
+            }
+            break;
+
+        case BOOST:
+            Serial.println("State: BOOST");
+            if (acceleration < APOGEE_THRESHOLD) {
+                state = COAST;
+            }
+            break;
+
+        case COAST:
+            Serial.println("State: COAST");
+            if (detectApogee()) {
+                deployDrogue();
+                state = DROGUE;
+            }
+            break;
+
+        case DROGUE:
+            Serial.println("State: DROGUE");
+            if (altitude <= MAIN_CHUTE_ALT) {
+                deployMain();
+                state = MAIN;
+            }
+            break;
+
+        case MAIN:
+            Serial.println("State: MAIN");
+            if (detectLanding()) {
+                activateBuzzer();
+                state = LANDED;
+            }
+            break;
+
+        case LANDED:
+            Serial.println("State: LANDED");
+            break;
+    }
+}
 
 void loop() 
 {
