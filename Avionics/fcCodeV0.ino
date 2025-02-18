@@ -170,6 +170,7 @@ void getGPSData()
             Serial.print("m | Satellites: ");
             Serial.println(gps.satellites.value());
         }
+  }
 }
 
 //flash data logging
@@ -181,7 +182,7 @@ void logData()
   {
     logfile.println(parameter);
     //call all get data functions
-    logfile.close();
+    logfile.close();    
   } 
   else 
   {
